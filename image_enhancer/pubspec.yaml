@@ -30,10 +30,12 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  http: ^1.1.0
+  dio: ^5.4.0
+  path_provider: ^2.1.1
   image_picker: ^1.0.4
-  http: ^0.13.6
-  path_provider: ^2.1.2
   file_picker: ^6.1.1
+  logging: ^1.2.0
 
 dev_dependencies:
   flutter_test:
