@@ -1,5 +1,5 @@
 name: image_enhancer
-description: "A new Flutter project."
+description: A Flutter application for enhancing image quality.
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -19,7 +19,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 version: 1.0.0+1
 
 environment:
-  sdk: ^3.7.2
+  sdk: '>=3.0.0 <4.0.0'
 
 # Dependencies specify other packages that your package needs in order to work.
 # To automatically upgrade your package dependencies to the latest versions
@@ -30,12 +30,16 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  image_picker: ^1.0.7
   http: ^1.1.0
+  path: ^1.8.3
+  cupertino_icons: ^1.0.2
+  path_provider: ^2.1.2
   dio: ^5.4.0
-  path_provider: ^2.1.1
-  image_picker: ^1.0.4
-  file_picker: ^6.1.1
+  file_picker: ^5.5.0
   logging: ^1.2.0
+  http_parser: ^4.0.2
+  share_plus: ^7.2.1
 
 dev_dependencies:
   flutter_test:
@@ -46,7 +50,7 @@ dev_dependencies:
   # activated in the `analysis_options.yaml` file located at the root of your
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
-  flutter_lints: ^5.0.0
+  flutter_lints: ^2.0.0
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -89,3 +93,6 @@ flutter:
   #
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
+
+# Thêm dòng này để chạy file test
+main: lib/main.dart

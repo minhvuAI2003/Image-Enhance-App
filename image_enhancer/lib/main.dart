@@ -8,8 +8,10 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:image_picker/image_picker.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:logging/logging.dart';
-import 'dart:convert';
-import 'dart:math';
+import 'package:http_parser/http_parser.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:path/path.dart' as path;
+import 'dart:typed_data';
 
 void main() {
   Logger.root.level = Level.ALL;
@@ -28,12 +30,27 @@ class MyApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
-          seedColor: Colors.blue,
+          seedColor: const Color(0xFF2196F3),
           brightness: Brightness.light,
         ),
         useMaterial3: true,
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            elevation: 2,
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+        ),
+        cardTheme: CardTheme(
+          elevation: 4,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
+        ),
       ),
-      home: ImageEnhancer(),
+      home: const ImageEnhancer(),
     );
   }
 }
@@ -45,13 +62,14 @@ class ImageEnhancer extends StatefulWidget {
   ImageEnhancerState createState() => ImageEnhancerState();
 }
 
-class ImageEnhancerState extends State<ImageEnhancer> {
+class ImageEnhancerState extends State<ImageEnhancer> with SingleTickerProviderStateMixin {
   File? _originalImage;
   File? _enhancedImage;
   bool _isLoading = false;
   String _selectedTask = 'derain';
-  int _retryCount = 0;
-  static const int _maxRetries = 3;
+  double _progress = 0.0;
+  late AnimationController _comparisonController;
+  Map<String, dynamic>? _imageInfo;
   final List<String> _tasks = [
     'derain',
     'gaussian_denoise',
@@ -68,11 +86,12 @@ class ImageEnhancerState extends State<ImageEnhancer> {
     // 'single_image_deblur': '/single-image-deblur',
   };
 
-  final String _baseUrl = 'http://localhost:8000';
+  final String _baseUrl = Platform.isMacOS 
+      ? 'http://127.0.0.1:8000'  // Use IP instead of localhost for macOS
+      : 'http://localhost:8000';
 
   Future<void> _testConnection() async {
     final logger = Logger('TestConnection');
-    _retryCount = 0;
     try {
       final dio = Dio();
       dio.options.connectTimeout = const Duration(seconds: 10);
@@ -128,22 +147,135 @@ class ImageEnhancerState extends State<ImageEnhancer> {
   void initState() {
     super.initState();
     _testConnection();
+    _comparisonController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 300),
+    );
+  }
+
+  @override
+  void dispose() {
+    _comparisonController.dispose();
+    super.dispose();
+  }
+
+  Future<Directory> _getUserDocumentsDirectory() async {
+    if (Platform.isMacOS || Platform.isLinux) {
+      final home = Platform.environment['HOME'] ?? '/Users';
+      return Directory('$home/Documents');
+    } else if (Platform.isWindows) {
+      final userProfile = Platform.environment['USERPROFILE'] ?? 'C:\\Users';
+      return Directory('$userProfile\\Documents');
+    } else {
+      // fallback: app's document dir
+      return await getApplicationDocumentsDirectory();
+    }
+  }
+
+  Future<void> _saveEnhancedImage() async {
+    if (_enhancedImage == null) return;
+
+    try {
+      if (kIsWeb) {
+        // Handle web platform
+        return;
+      }
+
+      String? savePath = await FilePicker.platform.saveFile(
+        dialogTitle: 'Chọn nơi lưu ảnh',
+        fileName: 'enhanced_${DateTime.now().millisecondsSinceEpoch}.png',
+        type: FileType.custom,
+        allowedExtensions: ['png'],
+      );
+
+      if (savePath == null) return; // User cancelled
+
+      final savedFile = await _enhancedImage!.copy(savePath);
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Đã lưu ảnh tại: ${savedFile.path}'),
+            action: SnackBarAction(
+              label: 'Chia sẻ',
+              onPressed: () => Share.shareXFiles([XFile(savedFile.path)]),
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Lỗi khi lưu ảnh: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _getImageInfo(File file) async {
+    try {
+      final bytes = await file.readAsBytes();
+      final size = bytes.length;
+      final extension = path.extension(file.path).toLowerCase();
+      
+      setState(() {
+        _imageInfo = {
+          'size': size,
+          'format': extension.replaceAll('.', ''),
+          'dimensions': 'Đang tải...',
+        };
+      });
+
+      // Get image dimensions
+      final image = await decodeImageFromList(bytes);
+      setState(() {
+        _imageInfo = {
+          'size': size,
+          'format': extension.replaceAll('.', ''),
+          'dimensions': '${image.width}x${image.height}',
+        };
+      });
+    } catch (e) {
+      print('Error getting image info: $e');
+    }
   }
 
   Future<void> _pickImage() async {
-    if (Platform.isMacOS || Platform.isWindows || kIsWeb) {
-      // Dùng file_picker cho macOS, Windows, hoặc web
+    if (kIsWeb) {
+      // Web platform
+      final ImagePicker picker = ImagePicker();
+      final XFile? image = await picker.pickImage(source: ImageSource.gallery);
+      if (image != null) {
+        final bytes = await image.readAsBytes();
+        final tempDir = await getTemporaryDirectory();
+        final tempFile = File('${tempDir.path}/temp_image.jpg');
+        await tempFile.writeAsBytes(bytes);
+        setState(() {
+          _originalImage = tempFile;
+          _enhancedImage = null;
+          _imageInfo = null;
+        });
+        _getImageInfo(tempFile);
+      }
+    } else if (Platform.isMacOS || Platform.isWindows) {
+      // Desktop platforms
       FilePickerResult? result = await FilePicker.platform.pickFiles(
         type: FileType.image,
       );
       if (result != null && result.files.single.path != null) {
+        final file = File(result.files.single.path!);
         setState(() {
-          _originalImage = File(result.files.single.path!);
+          _originalImage = file;
           _enhancedImage = null;
+          _imageInfo = null;
         });
+        _getImageInfo(file);
       }
     } else {
-      // Dùng image_picker cho iOS/Android
+      // Mobile platforms
       final pickedFile = await ImagePicker().pickImage(
         source: ImageSource.gallery,
       );
@@ -151,101 +283,35 @@ class ImageEnhancerState extends State<ImageEnhancer> {
         setState(() {
           _originalImage = File(pickedFile.path);
           _enhancedImage = null;
+          _imageInfo = null;
         });
+        _getImageInfo(File(pickedFile.path));
       }
     }
   }
 
+  Future<File> _createUniqueTempImageFile(Uint8List bytes) async {
+    final dir = await _getUserDocumentsDirectory();
+    final uniqueName = 'enhanced_image_${DateTime.now().millisecondsSinceEpoch}.png';
+    final file = File('${dir.path}/$uniqueName');
+    await file.writeAsBytes(bytes);
+    print('Đã lưu ảnh tạm tại: ${file.path}');
+    return file;
+  }
+
   Future<void> _enhanceImage() async {
     if (_originalImage == null) return;
-    setState(() => _isLoading = true);
-    _retryCount = 0;
+    setState(() {
+      _isLoading = true;
+      _progress = 0.0;
+      _enhancedImage = null;
+    });
 
     final logger = Logger('ImageEnhancer');
     final dio = Dio();
-    dio.options.connectTimeout = const Duration(seconds: 30);
-    dio.options.receiveTimeout = const Duration(seconds: 30);
-    dio.options.headers = {
-      'Accept': 'application/json',
-      'Content-Type': 'application/json',
-      'Connection': 'keep-alive',
-    };
-    
-    logger.info('Starting image enhancement...');
-    logger.info('Base URL: $_baseUrl');
-    logger.info('Headers: ${dio.options.headers}');
-    
-    // Add retry interceptor with limits
-    dio.interceptors.add(
-      InterceptorsWrapper(
-        onRequest: (RequestOptions options, RequestInterceptorHandler handler) {
-          logger.info('Making request to: ${options.uri}');
-          logger.info('Request method: ${options.method}');
-          logger.info('Request headers: ${options.headers}');
-          return handler.next(options);
-        },
-        onResponse: (Response response, ResponseInterceptorHandler handler) {
-          logger.info('Received response:');
-          logger.info('- Status code: ${response.statusCode}');
-          logger.info('- Headers: ${response.headers}');
-          logger.info('- Data: ${response.data}');
-          return handler.next(response);
-        },
-        onError: (DioException e, ErrorInterceptorHandler handler) async {
-          logger.warning('Error type: ${e.type}');
-          logger.warning('Error message: ${e.message}');
-          logger.warning('Request path: ${e.requestOptions.path}');
-          logger.warning('Request method: ${e.requestOptions.method}');
-          logger.warning('Request headers: ${e.requestOptions.headers}');
-          
-          if (e.type == DioExceptionType.connectionTimeout ||
-              e.type == DioExceptionType.connectionError ||
-              e.type == DioExceptionType.unknown) {
-            if (_retryCount < _maxRetries) {
-              _retryCount++;
-              logger.warning('Connection failed, retrying... (Attempt $_retryCount/$_maxRetries)');
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    content: Text('Đang thử kết nối lại... (Lần $_retryCount/$_maxRetries)'),
-                    backgroundColor: Colors.orange,
-                    duration: const Duration(seconds: 2),
-                  ),
-                );
-              }
-              await Future.delayed(Duration(seconds: pow(2, _retryCount - 1).toInt())); // Exponential backoff
-              try {
-                final response = await dio.request(
-                  e.requestOptions.path,
-                  options: Options(
-                    method: e.requestOptions.method,
-                    headers: e.requestOptions.headers,
-                    validateStatus: e.requestOptions.validateStatus,
-                  ),
-                  data: e.requestOptions.data,
-                  queryParameters: e.requestOptions.queryParameters,
-                );
-                return handler.resolve(response);
-              } catch (e) {
-                return handler.next(e as DioException);
-              }
-            } else {
-              logger.severe('Max retries reached. Connection failed.');
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Không thể kết nối đến server sau nhiều lần thử. Vui lòng kiểm tra kết nối mạng và thử lại.'),
-                    backgroundColor: Colors.red,
-                    duration: Duration(seconds: 5),
-                  ),
-                );
-              }
-            }
-          }
-          return handler.next(e);
-        },
-      ),
-    );
+    dio.options.connectTimeout = const Duration(seconds: 60);
+    dio.options.receiveTimeout = const Duration(seconds: 60);
+    dio.options.sendTimeout = const Duration(seconds: 60);
     
     try {
       final endpoint = _taskEndpoints[_selectedTask];
@@ -256,55 +322,97 @@ class ImageEnhancerState extends State<ImageEnhancer> {
       logger.info('Sending request to: $uri');
 
       final file = _originalImage!;
-      final bytes = await file.readAsBytes();
-      final base64Image = base64Encode(bytes);
+      final fileExtension = file.path.split('.').last.toLowerCase();
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final uniqueFilename = 'image_$timestamp.$fileExtension';
+      print('Đang gửi file: ${file.path} với tên mới: $uniqueFilename');
       
+      // Ensure file is an image and has proper extension
+      if (!['jpg', 'jpeg', 'png', 'gif'].contains(fileExtension)) {
+        throw Exception('File phải là ảnh (jpg, jpeg, png, hoặc gif)');
+      }
+
+      // Check file size (limit to 10MB)
+      final fileSize = await file.length();
+      if (fileSize > 10 * 1024 * 1024) {
+        throw Exception('File quá lớn. Kích thước tối đa là 10MB');
+      }
+
       logger.info('File info:');
       logger.info('- Path: ${file.path}');
-      logger.info('- Size: ${bytes.length} bytes');
-      logger.info('- Base64 length: ${base64Image.length}');
+      logger.info('- Extension: $fileExtension');
+      logger.info('- Size: $fileSize bytes');
 
-      try {
-        final response = await dio.post(
-          uri,
-          data: {
-            'image': base64Image,
-            'task': _selectedTask,
+      // Gửi file đúng định dạng như Postman
+      final formData = FormData.fromMap({
+        'file': await MultipartFile.fromFile(
+          file.path,
+          filename: uniqueFilename,
+          contentType: MediaType('image', fileExtension == 'jpg' ? 'jpeg' : fileExtension),
+        ),
+      });
+
+      logger.info('Sending form data with fields: ${formData.fields}');
+      logger.info('Sending form data with files: ${formData.files}');
+
+      // Simulate progress updates
+      Timer.periodic(const Duration(milliseconds: 100), (timer) {
+        if (_progress < 0.9) {
+          setState(() {
+            _progress += 0.1;
+          });
+        }
+      });
+
+      final response = await dio.post(
+        uri,
+        data: formData,
+        options: Options(
+          validateStatus: (status) => status! < 500,
+          headers: {
+            'Accept': 'image/png',
           },
-          options: Options(
-            validateStatus: (status) => status! < 500,
-            followRedirects: true,
-            maxRedirects: 5,
+          responseType: ResponseType.bytes,
+        ),
+        onReceiveProgress: (received, total) {
+          if (total != -1) {
+            setState(() {
+              _progress = received / total;
+            });
+          }
+        },
+      );
+      
+      if (response.statusCode == 200) {
+        print('Đã nhận ảnh xử lý mới từ server!');
+        final enhancedFile = await _createUniqueTempImageFile(response.data);
+        setState(() {
+          _enhancedImage = enhancedFile;
+          _progress = 1.0;
+        });
+        _getImageInfo(enhancedFile);
+      } else {
+        final errorMessage = response.data is List 
+            ? String.fromCharCodes(response.data)
+            : response.data.toString();
+        logger.severe('Server error: $errorMessage');
+        throw Exception('Lỗi server: ${response.statusCode} - $errorMessage');
+      }
+    } on DioException catch (e) {
+      logger.severe('Network error: ${e.message}');
+      logger.severe('Error type: ${e.type}');
+      if (e.response != null) {
+        logger.severe('Response data: ${e.response?.data}');
+        logger.severe('Response status: ${e.response?.statusCode}');
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Lỗi kết nối: ${e.message}'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 5),
           ),
         );
-
-        logger.info('Response status code: ${response.statusCode}');
-        logger.info('Response data: ${response.data}');
-
-        if (response.statusCode == 200 && response.data['enhanced_image'] != null) {
-          final responseData = response.data;
-          final enhancedImageBase64 = responseData['enhanced_image'];
-          final enhancedImageBytes = base64Decode(enhancedImageBase64);
-          
-          logger.info('Enhanced image info:');
-          logger.info('- Base64 length: ${enhancedImageBase64.length}');
-          logger.info('- Bytes length: ${enhancedImageBytes.length}');
-          
-          final dir = await getTemporaryDirectory();
-          final enhancedFile = File('${dir.path}/enhanced_image.png');
-          await enhancedFile.writeAsBytes(enhancedImageBytes);
-          setState(() => _enhancedImage = enhancedFile);
-        } else {
-          logger.severe('Invalid response: ${response.data}');
-          throw Exception('Failed to enhance image: ${response.statusCode} - ${response.data}');
-        }
-      } on DioException catch (e) {
-        logger.severe('Network error: ${e.message}');
-        logger.severe('Error type: ${e.type}');
-        logger.severe('Request path: ${e.requestOptions.path}');
-        logger.severe('Request method: ${e.requestOptions.method}');
-        logger.severe('Request headers: ${e.requestOptions.headers}');
-        throw Exception('Network error: ${e.message}');
       }
     } catch (e) {
       logger.severe('Error during image enhancement: $e');
@@ -322,62 +430,150 @@ class ImageEnhancerState extends State<ImageEnhancer> {
     }
   }
 
+  Widget _buildImageInfo() {
+    if (_imageInfo == null) return const SizedBox.shrink();
+
+    return Card(
+      elevation: 2,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Thông tin ảnh',
+              style: TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+                color: Colors.grey[700],
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text('Kích thước: ${(_imageInfo!['size'] / 1024).toStringAsFixed(1)} KB'),
+            Text('Định dạng: ${_imageInfo!['format'].toUpperCase()}'),
+            Text('Kích thước: ${_imageInfo!['dimensions']}'),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildImageSection() {
     if (_originalImage == null) {
       return Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(Icons.image, size: 64, color: Colors.grey[400]),
-          SizedBox(height: 16),
+          Icon(Icons.image, size: 80, color: Colors.grey[400]),
+          const SizedBox(height: 16),
           Text(
             'Chưa chọn ảnh',
-            style: TextStyle(fontSize: 18, color: Colors.grey[600]),
+            style: TextStyle(fontSize: 20, color: Colors.grey[600], fontWeight: FontWeight.w500),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Hãy chọn một ảnh để bắt đầu',
+            style: TextStyle(fontSize: 16, color: Colors.grey[500]),
           ),
         ],
       );
     }
+
     return Column(
       children: [
-        Card(
-          elevation: 4,
-          child: Padding(
-            padding: const EdgeInsets.all(8.0),
-            child: Column(
-              children: [
-                Text(
-                  'Ảnh gốc',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                ),
-                SizedBox(height: 8),
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(8),
-                  child: Image.file(_originalImage!, height: 200),
-                ),
-              ],
-            ),
-          ),
-        ),
-        SizedBox(height: 16),
-        if (_enhancedImage != null)
-          Card(
-            elevation: 4,
-            child: Padding(
-              padding: const EdgeInsets.all(8.0),
-              child: Column(
-                children: [
-                  Text(
-                    'Ảnh sau khi xử lý',
-                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        _buildImageInfo(),
+        const SizedBox(height: 16),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: Card(
+                elevation: 4,
+                child: Container(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(16),
+                    gradient: LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [Colors.blue.shade50, Colors.white],
+                    ),
                   ),
-                  SizedBox(height: 8),
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(8),
-                    child: Image.file(_enhancedImage!, height: 200),
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    children: [
+                      Text(
+                        'Ảnh gốc',
+                        style: const TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF2196F3),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Hero(
+                        tag: 'original_image',
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: Image.file(_originalImage!, height: 250),
+                        ),
+                      ),
+                    ],
                   ),
-                ],
+                ),
               ),
             ),
+            if (_enhancedImage != null) ...[
+              const SizedBox(width: 16),
+              Expanded(
+                child: Card(
+                  elevation: 4,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(16),
+                      gradient: LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: [Colors.green.shade50, Colors.white],
+                      ),
+                    ),
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      children: [
+                        Text(
+                          'Ảnh sau khi xử lý',
+                          style: const TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFF4CAF50),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        Hero(
+                          tag: 'enhanced_image',
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(12),
+                            child: Image.file(_enhancedImage!, height: 250),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+        if (_enhancedImage != null) ...[
+          const SizedBox(height: 16),
+          ElevatedButton.icon(
+            icon: const Icon(Icons.save),
+            label: const Text('Lưu ảnh'),
+            onPressed: _saveEnhancedImage,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF4CAF50),
+              foregroundColor: Colors.white,
+            ),
           ),
+        ],
       ],
     );
   }
@@ -386,107 +582,191 @@ class ImageEnhancerState extends State<ImageEnhancer> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text('AI Nâng Cao Chất Lượng Ảnh'),
+        title: const Text(
+          'AI Nâng Cao Chất Lượng Ảnh',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
         centerTitle: true,
-        elevation: 2,
+        elevation: 0,
+        backgroundColor: Colors.transparent,
+        actions: [
+          if (_enhancedImage != null)
+            IconButton(
+              icon: const Icon(Icons.share),
+              onPressed: () => Share.shareXFiles([XFile(_enhancedImage!.path)]),
+              tooltip: 'Chia sẻ ảnh',
+            ),
+        ],
       ),
+      extendBodyBehindAppBar: true,
       body: Container(
         decoration: BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.topCenter,
             end: Alignment.bottomCenter,
-            colors: [Colors.blue.shade50, Colors.white],
+            colors: [
+              Colors.blue.shade50,
+              Colors.white,
+              Colors.blue.shade50,
+            ],
           ),
         ),
-        child: Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Expanded(
-                child: Center(
-                  child: SingleChildScrollView(child: _buildImageSection()),
-                ),
-              ),
-              if (_isLoading)
-                Padding(
-                  padding: const EdgeInsets.all(16.0),
-                  child: Column(
-                    children: [
-                      CircularProgressIndicator(),
-                      SizedBox(height: 8),
-                      Text('Đang xử lý ảnh...'),
-                    ],
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(20.0),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Expanded(
+                  child: Center(
+                    child: SingleChildScrollView(
+                      physics: const BouncingScrollPhysics(),
+                      child: _buildImageSection(),
+                    ),
                   ),
                 ),
-              Card(
-                elevation: 4,
-                child: Padding(
-                  padding: const EdgeInsets.all(16.0),
-                  child: Column(
-                    children: [
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                        children: [
-                          ElevatedButton.icon(
-                            icon: Icon(Icons.image),
-                            label: Text("Chọn ảnh"),
-                            onPressed: _pickImage,
-                            style: ElevatedButton.styleFrom(
-                              padding: EdgeInsets.symmetric(
-                                horizontal: 24,
-                                vertical: 12,
-                              ),
-                            ),
-                          ),
-                          ElevatedButton.icon(
-                            icon: Icon(Icons.auto_fix_high),
-                            label: Text("Xử lý ảnh"),
-                            onPressed:
-                                _originalImage == null ? null : _enhanceImage,
-                            style: ElevatedButton.styleFrom(
-                              padding: EdgeInsets.symmetric(
-                                horizontal: 24,
-                                vertical: 12,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                      SizedBox(height: 16),
-                      Container(
-                        padding: EdgeInsets.symmetric(horizontal: 16),
-                        decoration: BoxDecoration(
-                          border: Border.all(color: Colors.grey.shade300),
-                          borderRadius: BorderRadius.circular(8),
+                if (_isLoading)
+                  Container(
+                    padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withOpacity(0.9),
+                      borderRadius: BorderRadius.circular(16),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withOpacity(0.1),
+                          blurRadius: 10,
+                          offset: const Offset(0, 5),
                         ),
-                        child: DropdownButton<String>(
-                          value: _selectedTask,
-                          items:
-                              _tasks.map((task) {
+                      ],
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Stack(
+                          alignment: Alignment.center,
+                          children: [
+                            SizedBox(
+                              width: 40,
+                              height: 40,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 3,
+                                value: _progress,
+                                valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF2196F3)),
+                              ),
+                            ),
+                            Text(
+                              '${(_progress * 100).toInt()}%',
+                              style: const TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          'Đang xử lý ảnh...',
+                          style: TextStyle(
+                            fontSize: 16,
+                            color: Colors.grey[700],
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                const SizedBox(height: 20),
+                Card(
+                  elevation: 4,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(16),
+                      gradient: LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: [Colors.white, Colors.blue.shade50],
+                      ),
+                    ),
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                          children: [
+                            Tooltip(
+                              message: 'Chọn ảnh từ thư viện',
+                              child: ElevatedButton.icon(
+                                icon: const Icon(Icons.image),
+                                label: const Text(
+                                  "Chọn ảnh",
+                                  style: TextStyle(fontSize: 16),
+                                ),
+                                onPressed: _pickImage,
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.white,
+                                  foregroundColor: const Color(0xFF2196F3),
+                                ),
+                              ),
+                            ),
+                            Tooltip(
+                              message: 'Xử lý ảnh với AI',
+                              child: ElevatedButton.icon(
+                                icon: const Icon(Icons.auto_fix_high),
+                                label: const Text(
+                                  "Xử lý ảnh",
+                                  style: TextStyle(fontSize: 16),
+                                ),
+                                onPressed: _originalImage == null ? null : _enhanceImage,
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: const Color(0xFF2196F3),
+                                  foregroundColor: Colors.white,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 20),
+                        Tooltip(
+                          message: 'Chọn loại xử lý ảnh',
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: Colors.grey.shade300),
+                            ),
+                            child: DropdownButton<String>(
+                              value: _selectedTask,
+                              items: _tasks.map((task) {
                                 return DropdownMenuItem(
                                   value: task,
                                   child: Text(
                                     task.replaceAll('_', ' ').toUpperCase(),
-                                    style: TextStyle(fontSize: 16),
+                                    style: const TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.w500,
+                                    ),
                                   ),
                                 );
                               }).toList(),
-                          onChanged: (value) {
-                            setState(() {
-                              _selectedTask = value!;
-                            });
-                          },
-                          isExpanded: true,
-                          underline: SizedBox(),
-                          icon: Icon(Icons.arrow_drop_down),
+                              onChanged: (value) {
+                                setState(() {
+                                  _selectedTask = value!;
+                                });
+                              },
+                              isExpanded: true,
+                              underline: const SizedBox(),
+                              icon: const Icon(Icons.arrow_drop_down),
+                              dropdownColor: Colors.white,
+                            ),
+                          ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
