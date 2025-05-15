@@ -23,6 +23,7 @@ Image-Enhance-App là một ứng dụng desktop/mobile cho phép người dùng
    ```bash
    git clone https://github.com/yourusername/Image-Enhance-App.git
    cd Image-Enhance-App
+   cd image_enhancer
    ```
 2. Cài đặt các dependencies:
    ```bash
